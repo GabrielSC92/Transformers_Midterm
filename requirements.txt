@@ -1,0 +1,6 @@
+torch
+python-chess
+huggingface_hub
+datasets
+tqdm
+matplotlib
