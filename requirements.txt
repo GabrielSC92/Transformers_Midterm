@@ -4,3 +4,5 @@ huggingface_hub
 datasets
 tqdm
 matplotlib
+plotly
+nbformat>=4.2.0

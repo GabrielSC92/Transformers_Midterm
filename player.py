@@ -31,8 +31,12 @@ class TransformerPlayer(Player):
         name: str = "RecurrentTransformer",
         repo_id: str = HF_REPO,
         device: Optional[str] = None,
+        lookahead_plies: int = 0,
+        lookahead_top_k: int = 5,
     ):
         super().__init__(name)
+        self.lookahead_plies = lookahead_plies
+        self.lookahead_top_k = lookahead_top_k
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
@@ -54,6 +58,23 @@ class TransformerPlayer(Player):
         self.model.to(self.device)
         self.model.eval()
 
+    def _score_position(self, fen: str) -> float:
+        """Return model's max logit over legal moves for the side to move (higher = they have a strong move)."""
+        board = chess.Board(fen)
+        legal_moves = list(board.legal_moves)
+        if not legal_moves:
+            return float("-inf")
+        tokens = self.tokenizer.encode(fen)
+        input_ids = torch.tensor([tokens], device=self.device)
+        logits = self.model(input_ids).squeeze(0)
+        legal_uci = {m.uci() for m in legal_moves}
+        best = float("-inf")
+        for uci in legal_uci:
+            idx = MOVE_TO_IDX.get(uci)
+            if idx is not None and logits[idx].item() > best:
+                best = logits[idx].item()
+        return best
+
     @torch.no_grad()
     def get_move(self, fen: str) -> Optional[str]:
         board = chess.Board(fen)
@@ -74,5 +95,31 @@ class TransformerPlayer(Player):
                 mask[idx] = 0.0
         logits = logits + mask
 
-        best_idx = logits.argmax().item()
-        return MOVE_VOCAB[best_idx]
+        if self.lookahead_plies <= 0:
+            best_idx = logits.argmax().item()
+            return MOVE_VOCAB[best_idx]
+
+        # 1-ply lookahead: score each of our top-k moves by the resulting position (opponent to move).
+        # We want to minimize opponent's best response, so score = -opponent_max_logit.
+        top_k = min(self.lookahead_top_k, len(legal_moves))
+        move_scores = []
+        for m in legal_moves:
+            idx = MOVE_TO_IDX.get(m.uci())
+            if idx is None:
+                continue
+            move_scores.append((m, logits[idx].item()))
+        move_scores.sort(key=lambda x: -x[1])
+        move_scores = move_scores[:top_k]
+
+        best_move = move_scores[0][0]
+        best_score = float("-inf")
+        for m, _ in move_scores:
+            board.push(m)
+            opp_score = self._score_position(board.fen())
+            board.pop()
+            # We want positions where opponent is worse: minimize their max logit
+            our_score = -opp_score
+            if our_score > best_score:
+                best_score = our_score
+                best_move = m
+        return best_move.uci()
