@@ -3,6 +3,11 @@
 Generate (FEN, UCI) training data using the engine's best move instead of human moves.
 Data quality matches model ambition: train to imitate the best available play.
 
+Stockfish is configured for strongest play (Skill Level 20, no strength limit). The move
+returned is the engine's best for the given --engine-time or --engine-depth; there is
+no extra check that it is the global optimum (that would require a second, longer search).
+For higher-quality labels use --engine-depth 10 or higher, or --engine-time 0.1+.
+
 Supports:
   1. Local Stockfish (python-chess) — no API key, no rate limits. Recommended.
   2. Assignment EnginePlayer (RapidAPI) — use if you don't have Stockfish installed.
@@ -22,6 +27,10 @@ In train.ipynb, replace the "Extract (FEN, UCI) pairs" cell with loading from th
 Usage:
   # Local Stockfish (install from https://stockfishchess.org or package manager)
   python generate_engine_data.py --mode fens --engine local --target 500000 --out engine_data.jsonl
+
+  # Stronger labels: more time or depth (default time=0.02s is fast but shallow)
+  python generate_engine_data.py --mode fens --engine local --target 500000 --engine-depth 10
+  python generate_engine_data.py --mode fens --engine local --target 500000 --engine-time 0.1
 
   # FENs from dataset, engine from RapidAPI (set RAPIDAPI_KEY)
   python generate_engine_data.py --mode fens --engine api --target 100000 --out engine_data.jsonl
@@ -77,13 +86,19 @@ def _worker_process(
     engine_time: float,
     engine_depth: int | None,
     threads: int,
+    hash_mb: int,
 ) -> None:
     """Run in a separate process: consume FENs from input_queue, run Stockfish, put (fen, uci) in output_queue."""
     import chess.engine
     try:
         engine = chess.engine.SimpleEngine.popen_uci(engine_path)
         try:
-            engine.configure({"Threads": threads})
+            # Stockfish UCI: Threads + Hash (after Threads) for performance; Skill Level 20 = strongest (no weakening)
+            engine.configure({
+                "Threads": threads,
+                "Hash": hash_mb,
+                "Skill Level": 20,
+            })
         except Exception:
             pass
         limit = chess.engine.Limit(depth=engine_depth) if engine_depth else chess.engine.Limit(time=engine_time)
@@ -184,15 +199,25 @@ def run_mode_fens(args, out_file):
                     break
             if found is not None:
                 engine_path = str(found)
-            else:
+            elif sys.platform == "win32":
+                # Windows: try common Downloads unpack path
+                fallback = Path(os.path.expanduser("~")) / "Downloads" / "stockfish-windows-x86-64-avx2" / "stockfish" / "stockfish-windows-x86-64-avx2.exe"
+                if fallback.is_file():
+                    engine_path = str(fallback.resolve())
+                    found = fallback
+            if found is None:
                 print(f"Stockfish not found at: {engine_path}", file=sys.stderr)
                 print("Check the path in Explorer and pass --stockfish-path with the exact exe path.", file=sys.stderr)
                 sys.exit(1)
-        print(f"Using local Stockfish: {engine_path} (time={args.engine_time}s, depth={args.engine_depth}, threads={args.threads}, workers={args.workers})")
+        print(f"Using local Stockfish: {engine_path} (time={args.engine_time}s, depth={args.engine_depth}, threads={args.threads}, hash={args.hash_mb}MB, workers={args.workers})")
         if args.workers <= 1:
             engine = chess.engine.SimpleEngine.popen_uci(engine_path)
             try:
-                engine.configure({"Threads": args.threads})
+                engine.configure({
+                    "Threads": args.threads,
+                    "Hash": args.hash_mb,
+                    "Skill Level": 20,
+                })
             except Exception:
                 pass
             def get_move(fen):
@@ -223,7 +248,7 @@ def run_mode_fens(args, out_file):
             workers_list = [
                 Process(
                     target=_worker_process,
-                    args=(input_queue, output_queue, engine_path, args.engine_time, args.engine_depth, args.threads),
+                    args=(input_queue, output_queue, engine_path, args.engine_time, args.engine_depth, args.threads, args.hash_mb),
                 )
                 for _ in range(args.workers)
             ]
@@ -365,8 +390,9 @@ def main():
     p.add_argument("--min-elo", type=int, default=0, help="Min white/black ELO when sampling FENs from dataset")
     p.add_argument("--stockfish-path", type=str, default=None, help="Path to Stockfish binary (default: stockfish in PATH)")
     p.add_argument("--engine-time", type=float, default=0.02, help="Seconds per move for local Stockfish (lower = faster, slightly weaker)")
-    p.add_argument("--engine-depth", type=int, default=None, help="If set, use depth limit instead of time (e.g. 5 = fast, 10 = stronger)")
+    p.add_argument("--engine-depth", type=int, default=None, help="If set, use depth limit instead of time (e.g. 5 = fast, 10 = stronger, 15+ for best move quality)")
     p.add_argument("--threads", type=int, default=4, help="Stockfish UCI Threads per engine (more = faster per position)")
+    p.add_argument("--hash-mb", type=int, default=128, help="Stockfish Hash table size in MB (higher can improve search quality)")
     p.add_argument("--workers", type=int, default=1, help="Number of parallel Stockfish processes (e.g. 8 for 8 cores)")
     p.add_argument("--api-delay", type=float, default=0.5, help="Delay between API calls (seconds) to avoid rate limit")
     # games mode
