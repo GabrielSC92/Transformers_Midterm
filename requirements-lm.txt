@@ -1,0 +1,8 @@
+# For LM fine-tune and LM player (train_lm.py, player_lm.py). Install after base requirements.
+# pip install -r requirements.txt && pip install -r requirements-lm.txt
+transformers>=4.36
+datasets
+peft
+trl
+accelerate
+bitsandbytes
