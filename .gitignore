@@ -8,3 +8,4 @@ training_curves.png
 .ipynb_checkpoints/
 matchup/
 *.pdf
+engine_data.jsonl
