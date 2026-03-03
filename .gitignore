@@ -6,3 +6,5 @@ venv/
 *.pth
 training_curves.png
 .ipynb_checkpoints/
+matchup/
+*.pdf
