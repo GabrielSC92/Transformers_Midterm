@@ -11,3 +11,4 @@ matchup/
 engine_data.jsonl
 config.json
 tokenizer.json
+*.png
