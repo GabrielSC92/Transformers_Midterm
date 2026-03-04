@@ -8,6 +8,10 @@ CORnet-s (Kubilius et al.) and BLT networks (Spoerer et al. 2017).
 Self-attention serves as lateral connections, weight-sharing across
 iterations implements recurrence, and iteration embeddings distinguish
 processing time-steps.
+
+Supports two tokenization modes:
+  - ChessTokenizer: character-level FEN encoding (legacy)
+  - BoardTokenizer: spatial 8x8 board encoding with structured metadata
 """
 
 import json
@@ -124,6 +128,87 @@ class ChessTokenizer:
 
 
 # ---------------------------------------------------------------------------
+# Spatial Board Tokenizer  (dict-based, separate arrays per token type)
+# ---------------------------------------------------------------------------
+
+# Piece IDs for the 64-square board array (vocab size 14)
+EMPTY_LIGHT = 0
+EMPTY_DARK = 1
+PIECE_TO_ID = {
+    "P": 2, "N": 3, "B": 4, "R": 5, "Q": 6, "K": 7,   # white
+    "p": 8, "n": 9, "b": 10, "r": 11, "q": 12, "k": 13,  # black
+}
+NUM_PIECE_IDS = 14   # 0-13
+
+# Sequence layout: turn(1) + castling(4) + board(64) + ep(1) = 70 tokens
+BOARD_SEQ_LEN = 70
+BOARD_START = 5      # index of first board-square token in the 70-token sequence
+BOARD_END = 69       # one past last board-square token
+
+
+def _is_light_square(sq_index: int) -> bool:
+    """True when the square is light-coloured (a1=dark, b1=light, ...)."""
+    return (sq_index % 8 + sq_index // 8) % 2 == 1
+
+
+class BoardTokenizer:
+    """Spatial tokenizer returning separate arrays per token type.
+
+    ``encode(fen)`` returns a dict with four keys:
+
+    =========  =====  ==================================
+    key        shape  description
+    =========  =====  ==================================
+    board      (64,)  piece IDs 0-13 in a1..h8 order
+    turn       (1,)   0 = black, 1 = white
+    castling   (4,)   K, Q, k, q — each 0 (no) or 1 (yes)
+    ep         (1,)   0 = none, 1-8 = files a-h
+    =========  =====  ==================================
+    """
+
+    def encode(self, fen: str) -> dict[str, list[int]]:
+        parts = fen.split()
+        board_str = parts[0]
+        side = parts[1] if len(parts) > 1 else "w"
+        castling = parts[2] if len(parts) > 2 else "-"
+        en_passant = parts[3] if len(parts) > 3 else "-"
+
+        board: list[int] = []
+        ranks = board_str.split("/")
+        for rank_idx in range(7, -1, -1):          # rank 1 … rank 8
+            for ch in ranks[rank_idx]:
+                if ch.isdigit():
+                    for _ in range(int(ch)):
+                        sq = len(board)
+                        board.append(EMPTY_LIGHT if _is_light_square(sq) else EMPTY_DARK)
+                else:
+                    board.append(PIECE_TO_ID.get(ch, EMPTY_LIGHT))
+
+        turn = [1 if side == "w" else 0]
+
+        castle = [
+            int("K" in castling),
+            int("Q" in castling),
+            int("k" in castling),
+            int("q" in castling),
+        ]
+
+        if en_passant == "-":
+            ep = [0]
+        else:
+            ep = [ord(en_passant[0]) - ord("a") + 1]   # 1=a … 8=h
+
+        return {"board": board, "turn": turn, "castling": castle, "ep": ep}
+
+    def to_dict(self) -> dict:
+        return {"type": "board_v2"}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BoardTokenizer":
+        return cls()
+
+
+# ---------------------------------------------------------------------------
 # Architecture
 # ---------------------------------------------------------------------------
 
@@ -177,100 +262,120 @@ class SharedTransformerBlock(nn.Module):
 
 
 class RecurrentTransformer(nn.Module):
-    """Universal Transformer-style model with shared weights across iterations.
+    """Universal Transformer-style model with spatial board encoding.
 
-    Architecture (CORnet-s / BLT inspired):
-      - Character-level token embeddings + sinusoidal positional encoding
-      - A single SharedTransformerBlock applied K times
-      - Learned iteration embeddings added at each step
-      - [CLS] token pooling → classification head over all UCI moves
+    Architecture (CORnet-s / BLT inspired, chess-transformers hybrid):
+      - Separate embedding tables for pieces, turn, castling, en passant
+      - Learned positional embeddings over the 70-token sequence
+      - A single SharedTransformerBlock applied K times (+ iteration embeddings)
+      - From / To heads: each board-square token is scored as source or dest
+
+    Input sequence layout (70 tokens):
+      [0]      turn            (turn_emb,    vocab 2)
+      [1-4]    castling K,Q,k,q (castle_emb, vocab 2, shared)
+      [5-68]   board a1..h8    (piece_emb,   vocab 14)
+      [69]     en passant      (ep_emb,      vocab 9)
     """
 
     def __init__(
         self,
-        vocab_size: int = 36,
-        d_model: int = 256,
+        d_model: int = 512,
         nhead: int = 8,
-        d_ff: int = 1024,
-        num_iterations: int = 6,
-        num_moves: int = NUM_MOVES,
-        max_seq_len: int = 128,
+        d_ff: int = 2048,
+        num_iterations: int = 8,
         dropout: float = 0.1,
-        pad_token_id: int = 0,
     ):
         super().__init__()
-        self.pad_token_id = pad_token_id
-        self.num_iterations = num_iterations
         self.d_model = d_model
+        self.num_iterations = num_iterations
 
-        self.token_emb = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
-        self.pos_enc = SinusoidalPositionalEncoding(d_model, max_len=max_seq_len)
+        # --- separate embedding tables ---
+        self.piece_emb = nn.Embedding(NUM_PIECE_IDS, d_model)   # 14
+        self.turn_emb = nn.Embedding(2, d_model)
+        self.castle_emb = nn.Embedding(2, d_model)              # shared K/Q/k/q
+        self.ep_emb = nn.Embedding(9, d_model)                  # 0=none, 1-8=a-h
+
+        # learned positional embeddings (70 positions)
+        self.pos_emb = nn.Embedding(BOARD_SEQ_LEN, d_model)
         self.emb_dropout = nn.Dropout(dropout)
 
-        # Learned iteration embeddings (broadcast across sequence positions)
+        # recurrent transformer block + iteration embeddings
         self.iter_emb = nn.Embedding(num_iterations, d_model)
-
-        # Single shared block
         self.block = SharedTransformerBlock(d_model, nhead, d_ff, dropout)
 
-        # Final layer norm + classification head
+        # final norm
         self.final_norm = nn.LayerNorm(d_model)
-        self.classifier = nn.Linear(d_model, num_moves)
+
+        # From / To heads — project each board token to a scalar score
+        self.from_head = nn.Linear(d_model, 1)
+        self.to_head = nn.Linear(d_model, 1)
 
         self._init_weights()
 
     def _init_weights(self):
         for p in self.parameters():
             if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+                nn.init.xavier_uniform_(p, gain=1.0)
+        # embeddings: normal with std = 1/sqrt(d_model)
+        emb_std = math.pow(self.d_model, -0.5)
+        for emb in (self.piece_emb, self.turn_emb, self.castle_emb,
+                     self.ep_emb, self.pos_emb):
+            nn.init.normal_(emb.weight, mean=0.0, std=emb_std)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    # ------------------------------------------------------------------
+
+    def forward(
+        self,
+        batch: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            input_ids: (batch, seq_len) token ids with [CLS] at position 0
+            batch: dict with keys ``board`` (B,64), ``turn`` (B,1),
+                   ``castling`` (B,4), ``ep`` (B,1).
         Returns:
-            logits: (batch, num_moves)
+            from_logits (B, 64), to_logits (B, 64)
         """
-        pad_mask = input_ids == self.pad_token_id  # True = ignore
+        turn_e = self.turn_emb(batch["turn"])           # (B, 1, d)
+        castle_e = self.castle_emb(batch["castling"])   # (B, 4, d)
+        board_e = self.piece_emb(batch["board"])        # (B, 64, d)
+        ep_e = self.ep_emb(batch["ep"])                 # (B, 1, d)
 
-        x = self.token_emb(input_ids)
-        x = self.pos_enc(x)
+        x = torch.cat([turn_e, castle_e, board_e, ep_e], dim=1)  # (B, 70, d)
+        x = x + self.pos_emb.weight.unsqueeze(0)
+        x = x * math.sqrt(self.d_model)
         x = self.emb_dropout(x)
 
-        iter_indices = torch.arange(
-            self.num_iterations, device=input_ids.device
-        )
+        device = x.device
+        iter_indices = torch.arange(self.num_iterations, device=device)
         for t in range(self.num_iterations):
-            # Add iteration embedding (broadcast over batch & seq)
             x = x + self.iter_emb(iter_indices[t]).unsqueeze(0).unsqueeze(0)
-            x = self.block(x, key_padding_mask=pad_mask)
+            x = self.block(x)
 
         x = self.final_norm(x)
-        cls_repr = x[:, 0]  # [CLS] position
-        logits = self.classifier(cls_repr)
-        return logits
+
+        board_repr = x[:, BOARD_START:BOARD_END, :]           # (B, 64, d)
+        from_logits = self.from_head(board_repr).squeeze(-1)  # (B, 64)
+        to_logits = self.to_head(board_repr).squeeze(-1)      # (B, 64)
+
+        return from_logits, to_logits
+
+    # ------------------------------------------------------------------
 
     def get_config(self) -> dict:
         return {
-            "vocab_size": self.token_emb.num_embeddings,
             "d_model": self.d_model,
             "nhead": self.block.self_attn.num_heads,
             "d_ff": self.block.ff[0].out_features,
             "num_iterations": self.num_iterations,
-            "num_moves": self.classifier.out_features,
-            "max_seq_len": self.pos_enc.pe.size(1),
-            "pad_token_id": self.pad_token_id,
+            "dropout": self.emb_dropout.p,
         }
 
     @classmethod
     def from_config(cls, config: dict) -> "RecurrentTransformer":
         return cls(
-            vocab_size=config["vocab_size"],
             d_model=config["d_model"],
             nhead=config["nhead"],
             d_ff=config["d_ff"],
             num_iterations=config["num_iterations"],
-            num_moves=config["num_moves"],
-            max_seq_len=config["max_seq_len"],
-            pad_token_id=config["pad_token_id"],
+            dropout=config.get("dropout", 0.1),
         )
