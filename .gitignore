@@ -9,3 +9,5 @@ training_curves.png
 matchup/
 *.pdf
 engine_data.jsonl
+config.json
+tokenizer.json
