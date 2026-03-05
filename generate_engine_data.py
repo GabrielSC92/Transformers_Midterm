@@ -51,6 +51,12 @@ from pathlib import Path
 import chess
 from tqdm import tqdm
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass
+
 # Optional: chess_tournament only needed for EnginePlayer / game-log mode
 def _optional_chess_tournament():
     try:
