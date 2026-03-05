@@ -1,12 +1,6 @@
-"""TransformerPlayer for the INFOMTALC chess tournament.
-
-Uses a Hybrid Spatial Recurrent Transformer with From/To prediction heads.
-Each legal move is scored as  from_logits[from_sq] + to_logits[to_sq]  and
-the highest-scoring legal move is returned. Promotions default to queen.
-"""
+"""TransformerPlayer for the INFOMTALC chess tournament."""
 
 import json
-import os
 from pathlib import Path
 from typing import Optional
 
@@ -26,69 +20,58 @@ class TransformerPlayer(Player):
         self,
         name: str = "RecurrentTransformer",
         repo_id: str = HF_REPO,
-        device: Optional[str] = None,
-        local_dir: Optional[str] = None,
+        device=None,
+        local_dir=None,
     ):
         super().__init__(name)
-        if device is None:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        else:
-            self.device = device
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        config_path: str = ""
-        tokenizer_path: str = ""
-        weights_path: str = ""
+        # try loading from local directory first, fall back to HF Hub
+        config_path = None
+        weights_path = None
 
         if local_dir is not None:
-            base = Path(local_dir).resolve()
-            cp = base / "config.json"
-            tp = base / "tokenizer.json"
+            base = Path(local_dir)
             wp = base / "model.pt"
             if not wp.exists():
                 wp = base / "best_model.pt"
-            if cp.exists() and tp.exists() and wp.exists():
-                config_path = str(cp)
-                tokenizer_path = str(tp)
+            if (base / "config.json").exists() and wp.exists():
+                config_path = str(base / "config.json")
                 weights_path = str(wp)
-            else:
-                local_dir = None
-        if local_dir is None:
+
+        if config_path is None:
             config_path = hf_hub_download(repo_id, "config.json")
             weights_path = hf_hub_download(repo_id, "model.pt")
-            tokenizer_path = hf_hub_download(repo_id, "tokenizer.json")
 
         with open(config_path) as f:
             config = json.load(f)
 
         self.tokenizer = BoardTokenizer()
         self.model = RecurrentTransformer.from_config(config)
-        state_dict = torch.load(weights_path,
-                                map_location=self.device,
-                                weights_only=True)
-        self.model.load_state_dict(state_dict)
+        assert weights_path is not None
+        state = torch.load(weights_path, map_location=self.device, weights_only=True)
+        self.model.load_state_dict(state)
         self.model.to(self.device)
         self.model.eval()
 
-    def _encode_fen(self, fen: str) -> dict[str, torch.Tensor]:
-        enc = self.tokenizer.encode(fen)
-        return {
-            "board": torch.tensor([enc["board"]], dtype=torch.long, device=self.device),
-            "turn": torch.tensor([enc["turn"]], dtype=torch.long, device=self.device),
-            "castling": torch.tensor([enc["castling"]], dtype=torch.long, device=self.device),
-            "ep": torch.tensor([enc["ep"]], dtype=torch.long, device=self.device),
-        }
-
-    @torch.no_grad()
     def get_move(self, fen: str) -> Optional[str]:
         board = chess.Board(fen)
         legal_moves = list(board.legal_moves)
         if not legal_moves:
             return None
 
-        batch = self._encode_fen(fen)
-        from_logits, to_logits = self.model(batch)
-        from_logits = from_logits.squeeze(0)   # (64,)
-        to_logits = to_logits.squeeze(0)       # (64,)
+        enc = self.tokenizer.encode(fen)
+        batch = {
+            "board": torch.tensor([enc["board"]], dtype=torch.long, device=self.device),
+            "turn": torch.tensor([enc["turn"]], dtype=torch.long, device=self.device),
+            "castling": torch.tensor([enc["castling"]], dtype=torch.long, device=self.device),
+            "ep": torch.tensor([enc["ep"]], dtype=torch.long, device=self.device),
+        }
+
+        with torch.no_grad():
+            from_logits, to_logits = self.model(batch)
+        from_logits = from_logits.squeeze(0)
+        to_logits = to_logits.squeeze(0)
 
         best_score = float("-inf")
         best_move = None
@@ -98,4 +81,4 @@ class TransformerPlayer(Player):
                 best_score = score
                 best_move = move
 
-        return best_move.uci() if best_move is not None else None
+        return best_move.uci() if best_move else None
