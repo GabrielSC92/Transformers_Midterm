@@ -1,177 +1,91 @@
-"""Generate (FEN, UCI) training data from Stockfish best moves."""
-
-import json
-import os
-import sys
-import threading
-from multiprocessing import Process, Queue
-from pathlib import Path
+# generate training data: for each FEN, get stockfish's best move
 
 import chess
 import chess.engine
+import json
+from datasets import load_dataset
+from multiprocessing import Pool
 from tqdm import tqdm
 
-# ── Configuration (tweak these before each run) ──────────────────────────────
-OUTPUT_FILE = "engine_data.jsonl"
-TARGET_POSITIONS = 500_000
+# config
+OUTPUT_FILE = "engine_data_test.jsonl"
+TARGET_POSITIONS = 10000
 MIN_ELO = 0
-
-STOCKFISH_PATH = "stockfish"  # or full path to exe
-ENGINE_DEPTH = 10
-THREADS_PER_ENGINE = 3
+STOCKFISH_PATH = r"C:\Users\Gabri\Downloads\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe"
+DEPTH = 10
+THREADS = 3
 HASH_MB = 128
 NUM_WORKERS = 8
-# ─────────────────────────────────────────────────────────────────────────────
 
 
-def _resolve_stockfish(path: str) -> str:
-    """Find the Stockfish executable, searching common locations on Windows."""
-    import shutil
+# each worker opens its own stockfish process
+stockfish = None
 
-    p = Path(path).resolve()
-    if p.is_file():
-        return str(p)
+def start_stockfish():
+    global stockfish
+    stockfish = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+    stockfish.configure({"Threads": THREADS, "Hash": HASH_MB})
 
-    found = shutil.which("stockfish")
-    if found:
-        return found
-
-    if sys.platform == "win32":
-        exe_names = [
-            "stockfish-windows-x86-64-avx2.exe",
-            "Stockfish.exe",
-            "stockfish.exe",
-        ]
-        search_dirs = [Path.cwd(), p.parent, p.parent.parent]
-        downloads = Path(os.path.expanduser("~")) / "Downloads"
-        search_dirs.extend(downloads.iterdir() if downloads.is_dir() else [])
-
-        for folder in search_dirs:
-            if not folder.is_dir():
-                continue
-            for name in exe_names:
-                candidate = folder / name
-                if candidate.is_file():
-                    return str(candidate.resolve())
-            for sub in folder.iterdir():
-                if sub.is_dir():
-                    for name in exe_names:
-                        candidate = sub / name
-                        if candidate.is_file():
-                            return str(candidate.resolve())
-
-    print(f"Stockfish not found at: {path}", file=sys.stderr)
-    sys.exit(1)
+def get_best_move(fen):
+    board = chess.Board(fen)
+    if board.is_game_over():
+        return None
+    result = stockfish.play(board, chess.engine.Limit(depth=DEPTH))  # type: ignore
+    if result.move is None:
+        return None
+    return (fen, result.move.uci())
 
 
-def _worker(input_q: Queue, output_q: Queue, engine_path: str) -> None:
-    """Stockfish worker process: reads FENs, writes (fen, uci) pairs."""
-    engine = chess.engine.SimpleEngine.popen_uci(engine_path)
-    try:
-        engine.configure({"Threads": THREADS_PER_ENGINE, "Hash": HASH_MB, "Skill Level": 20})
-    except Exception:
-        pass
-    limit = chess.engine.Limit(depth=ENGINE_DEPTH)
+def collect_fens():
+    """Collect FENs by replaying games from the HuggingFace dataset."""
+    fens = []
+    dataset = load_dataset("angeluriot/chess_games", split="train", streaming=True)
 
-    while True:
-        fen = input_q.get()
-        if fen is None:
+    for game in dataset:
+        if len(fens) >= TARGET_POSITIONS:
             break
-        try:
-            board = chess.Board(fen)
-            if board.is_game_over():
-                continue
-            result = engine.play(board, limit)
-            if result.move:
-                output_q.put((fen, result.move.uci()))
-        except Exception:
-            pass
 
-    engine.quit()
-    output_q.put(None)
-
-
-def stream_fens(target: int, min_elo: int = 0):
-    """Yield FENs from angeluriot/chess_games by replaying moves."""
-    from datasets import load_dataset
-
-    count = 0
-    ds = load_dataset("angeluriot/chess_games", split="train", streaming=True)
-    for row in ds:
-        if count >= target:
-            return
-        try:
-            w, b = int(row.get("white_elo") or 0), int(row.get("black_elo") or 0)
-            if w < min_elo or b < min_elo:
-                continue
-        except (TypeError, ValueError):
+        white_elo = int(game.get("white_elo") or 0)
+        black_elo = int(game.get("black_elo") or 0)
+        if white_elo < MIN_ELO or black_elo < MIN_ELO:
             continue
-        uci_moves = row.get("moves_uci")
-        if not uci_moves:
+
+        moves = game.get("moves_uci")
+        if not moves:
             continue
+
         board = chess.Board()
-        for uci_str in uci_moves:
-            if count >= target:
-                return
-            if board.is_game_over():
+        for move_uci in moves:
+            if len(fens) >= TARGET_POSITIONS or board.is_game_over():
                 break
             try:
-                move = chess.Move.from_uci(uci_str)
+                move = chess.Move.from_uci(move_uci)
                 if move not in board.legal_moves:
                     break
-            except (ValueError, chess.InvalidMoveError):
+            except Exception:
                 break
-            yield board.fen()
+            fens.append(board.fen())
             board.push(move)
-            count += 1
 
-
-def main() -> None:
-    engine_path = _resolve_stockfish(STOCKFISH_PATH)
-    print(f"Stockfish: {engine_path}")
-    print(f"depth={ENGINE_DEPTH}, threads={THREADS_PER_ENGINE}, hash={HASH_MB}MB, workers={NUM_WORKERS}")
-    print(f"Target: {TARGET_POSITIONS} positions → {OUTPUT_FILE}")
-
-    input_q: Queue = Queue()
-    output_q: Queue = Queue()
-
-    workers = [
-        Process(target=_worker, args=(input_q, output_q, engine_path))
-        for _ in range(NUM_WORKERS)
-    ]
-    for w in workers:
-        w.start()
-
-    def producer():
-        for fen in stream_fens(TARGET_POSITIONS, min_elo=MIN_ELO):
-            input_q.put(fen)
-        for _ in range(NUM_WORKERS):
-            input_q.put(None)
-
-    prod = threading.Thread(target=producer)
-    prod.start()
-
-    written = 0
-    stopped = 0
-    with open(OUTPUT_FILE, "w") as f:
-        pbar = tqdm(desc="Engine moves", total=TARGET_POSITIONS, unit="pos")
-        while stopped < NUM_WORKERS:
-            item = output_q.get()
-            if item is None:
-                stopped += 1
-                continue
-            fen, uci = item
-            f.write(json.dumps({"fen": fen, "uci": uci}) + "\n")
-            f.flush()
-            written += 1
-            pbar.update(1)
-        pbar.close()
-
-    prod.join()
-    for w in workers:
-        w.join()
-    print(f"Done — wrote {written} (FEN, UCI) pairs to {OUTPUT_FILE}")
+    return fens
 
 
 if __name__ == "__main__":
-    main()
+    print("Collecting FENs from dataset...")
+    fens = collect_fens()
+    print(f"Collected {len(fens)} positions, starting Stockfish analysis...")
+
+    pool = Pool(NUM_WORKERS, initializer=start_stockfish)
+    results = pool.imap_unordered(get_best_move, fens, chunksize=256)
+
+    count = 0
+    f = open(OUTPUT_FILE, "w")
+    for pair in tqdm(results, total=len(fens)):
+        if pair is not None:
+            fen, uci = pair
+            f.write(json.dumps({"fen": fen, "uci": uci}) + "\n")
+            count += 1
+    f.close()
+    pool.close()
+
+    print(f"Done! Wrote {count} positions to {OUTPUT_FILE}")
