@@ -2,13 +2,12 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+.ipynb_checkpoints/
+.env
 *.pt
 *.pth
-training_curves.png
-.ipynb_checkpoints/
-matchup/
-*.pdf
-engine_data.jsonl
 config.json
 tokenizer.json
+engine_data.jsonl
 *.png
+*.pdf
