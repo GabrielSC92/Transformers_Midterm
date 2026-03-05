@@ -136,9 +136,9 @@ class LocalEnginePlayer:
             try:
                 infos = engine.analyse(board, limit, multipv=2)
                 if len(infos) >= 2 and infos[1].get("pv"):
-                    return infos[1]["pv"][0].uci()
+                    return infos[1]["pv"][0].uci()  # type: ignore[index]
                 elif infos and infos[0].get("pv"):
-                    return infos[0]["pv"][0].uci()
+                    return infos[0]["pv"][0].uci()  # type: ignore[index]
             except Exception:
                 pass
             return random.choice(legal).uci()
@@ -738,7 +738,7 @@ def main():
                 f"Fallbacks hurt your tiebreaker ranking. ***")
         all_results.append(result)
         if hasattr(opponent, "close"):
-            opponent.close()
+            opponent.close()  # type: ignore[union-attr]
 
     if len(all_results) > 1:
         print_summary_table(all_results)

@@ -1,0 +1,5 @@
+{
+  "extraPaths": ["../chess_exam"],
+  "venvPath": ".",
+  "venv": "venv"
+}

@@ -35,18 +35,21 @@ class TransformerPlayer(Player):
         else:
             self.device = device
 
+        config_path: str = ""
+        tokenizer_path: str = ""
+        weights_path: str = ""
+
         if local_dir is not None:
             base = Path(local_dir).resolve()
-            config_path = base / "config.json"
-            tokenizer_path = base / "tokenizer.json"
-            weights_path = base / "model.pt"
-            if not weights_path.exists():
-                weights_path = base / "best_model.pt"
-            if config_path.exists() and tokenizer_path.exists(
-            ) and weights_path.exists():
-                config_path = str(config_path)
-                tokenizer_path = str(tokenizer_path)
-                weights_path = str(weights_path)
+            cp = base / "config.json"
+            tp = base / "tokenizer.json"
+            wp = base / "model.pt"
+            if not wp.exists():
+                wp = base / "best_model.pt"
+            if cp.exists() and tp.exists() and wp.exists():
+                config_path = str(cp)
+                tokenizer_path = str(tp)
+                weights_path = str(wp)
             else:
                 local_dir = None
         if local_dir is None:
