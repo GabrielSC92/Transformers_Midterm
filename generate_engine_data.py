@@ -88,4 +88,4 @@ if __name__ == "__main__":
     f.close()
     pool.close()
 
-    print(f"Done! Wrote {count} positions to {OUTPUT_FILE}")
+    print(f"Done. Wrote {count} positions to {OUTPUT_FILE}")
