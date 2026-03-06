@@ -142,7 +142,7 @@ class SharedTransformerBlock(nn.Module):
         return x
 
 
-# the actual model — like sgrvinod's ChessTransformerEncoderFT but with
+# the actual model, like sgrvinod's ChessTransformerEncoderFT but with
 # shared weights across iterations instead of separate layers
 # (idea from CORnet-s: 4 recurrent layers ~ 100+ feedforward layers)
 class RecurrentTransformer(nn.Module):
