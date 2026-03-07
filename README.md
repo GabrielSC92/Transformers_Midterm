@@ -28,7 +28,7 @@ Cross-entropy on from-square and to-square. AdamW, Vaswani LR schedule (warmup 4
 
 ## Repo
 
-model.py (BoardTokenizer, RecurrentTransformer), player.py (TransformerPlayer), train.ipynb (data, training, HF upload), generate_engine_data.py, run_test.py (local tests vs Random/Stockfish etc), requirements.txt.
+model_2.py (BoardTokenizer, RecurrentTransformer), player.py (TransformerPlayer), train.ipynb (data, training, HF upload), generate_engine_data.py, run_test.py (local tests vs Random/Stockfish etc), requirements.txt.
 
 ## Usage
 
