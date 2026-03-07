@@ -9,7 +9,7 @@ import torch
 from huggingface_hub import hf_hub_download
 
 from chess_tournament import Player
-from model import BoardTokenizer, RecurrentTransformer
+from .model import BoardTokenizer, RecurrentTransformer
 
 HF_REPO = "Izzent/recurrent-transformer-chess"
 
