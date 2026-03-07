@@ -1,6 +1,6 @@
-# Transformers Midterm — Recurrent Transformer Chess Player
+# Transformers Midterm - Recurrent Transformer Chess Player
 
-MSc Applied Data Science, Utrecht University — INFOMTALC 2025/26
+MSc Applied Data Science, Utrecht University - INFOMTALC 2025/26
 
 ## Assignment
 
