@@ -20,7 +20,7 @@ Board is encoded as 70 tokens (turn, castling x4, 64 squares, en passant). Spati
 
 ## Data
 
-generate_engine_data.py uses local Stockfish to get best moves for positions from angeluriot/chess_games (ELO >= 1500). Stockfish depth 10, 8 workers, output 750K (FEN, UCI) pairs in JSONL.
+generate_engine_data.py uses local Stockfish to get best moves for positions from angeluriot/chess_games (ELO >= 1500). Stockfish depth 10, 8 workers, output 2M (FEN, UCI) pairs in JSONL.
 
 ## Training
 
