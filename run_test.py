@@ -2,7 +2,7 @@
 """
 Evaluate TransformerPlayer against assignment baseline opponents.
 
-Supports: random, engine-strong, engine-weak, local-strong, local-weak, lm, smol.
+Supports: random, engine-strong, engine-weak, local-strong, local-weak, lm, smol, sayed.
 Use --opponent to pick one, or --all to run every available opponent in sequence.
 
 local-strong/local-weak use a LOCAL Stockfish binary (no API key needed, much faster).
@@ -47,8 +47,11 @@ except ImportError:
 from chess_tournament import Game, RandomPlayer
 from player import TransformerPlayer
 
-OPPONENT_CHOICES = ["random", "engine-strong", "engine-weak", "local-strong", "local-weak", "lm", "smol"]
+OPPONENT_CHOICES = ["random", "engine-strong", "engine-weak", "local-strong", "local-weak", "lm", "smol", "sayed"]
+MODEL_CHOICES = ["recurrent", "sayed"]
+COLOR_CHOICES = ["white", "black", "alternating"]
 TP_NAME = "RecurrentTransformer"
+SAYED_NAME = "Sayed_player"
 
 TOURNAMENT_TEST_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKB1R w KQkq - 0 1"
 UCI_RE = re.compile(r"^[a-h][1-8][a-h][1-8][qrbn]?$", re.IGNORECASE)
@@ -299,6 +302,10 @@ def check_opponent_available(name: str) -> tuple[bool, str]:
         if not _check_hf_token():
             return False, "HF_TOKEN env var not set"
         return True, ""
+    if name == "sayed":
+        if not _check_gpu():
+            return False, "No GPU available (SayedPlayer needs CUDA)"
+        return True, ""
     return False, f"Unknown opponent: {name}"
 
 
@@ -317,6 +324,16 @@ def make_opponent(name: str, stockfish_path: str | None = None):
         return EnginePlayer("Stockfish-Strong",
                             blunder_rate=0.0,
                             ponder_rate=0.05)
+        
+    if name == "sayed":
+        import importlib.util
+        sayed_path = os.path.join(_REPO_ROOT, "INFOMTALC-chess", "player.py")
+        spec = importlib.util.spec_from_file_location("infomtalc_chess_player", sayed_path)
+        if spec is None or spec.loader is None:
+            raise FileNotFoundError(f"SayedPlayer module not found: {sayed_path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.TransformerPlayer("Sayed_player")
 
     if name == "engine-weak":
         from chess_tournament import EnginePlayer
@@ -349,6 +366,23 @@ def make_opponent(name: str, stockfish_path: str | None = None):
     raise ValueError(f"Unknown opponent: {name}")
 
 
+def make_main_player(model: str, local_dir: Optional[str] = None):
+    """Create the main player (model under test). Returns (player, display_name)."""
+    if model == "recurrent":
+        tp = run_tournament_validation(local_dir=local_dir)
+        return tp, TP_NAME
+    if model == "sayed":
+        import importlib.util
+        sayed_path = os.path.join(_REPO_ROOT, "INFOMTALC-chess", "player.py")
+        spec = importlib.util.spec_from_file_location("infomtalc_chess_player", sayed_path)
+        if spec is None or spec.loader is None:
+            raise FileNotFoundError(f"SayedPlayer module not found: {sayed_path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.TransformerPlayer(SAYED_NAME), SAYED_NAME
+    raise ValueError(f"Unknown model: {model}")
+
+
 # ---------------------------------------------------------------------------
 # Match runner
 # ---------------------------------------------------------------------------
@@ -358,8 +392,10 @@ def run_matchup(tp,
                 opponent,
                 num_games: int,
                 max_half_moves: int,
-                white_only: bool = False) -> dict:
-    """Play num_games. If white_only, tp always plays white (like notebook); else alternating colors."""
+                white_only: bool = False,
+                black_only: bool = False,
+                tp_name: str = TP_NAME) -> dict:
+    """Play num_games. If white_only, tp always white; if black_only, tp always black; else alternating."""
     results = Counter()
     tp_wins = 0
     opp_wins = 0
@@ -372,6 +408,8 @@ def run_matchup(tp,
     for i in range(num_games):
         if white_only:
             white, black = tp, opponent
+        elif black_only:
+            white, black = opponent, tp
         else:
             white = tp if i % 2 == 0 else opponent
             black = opponent if i % 2 == 0 else tp
@@ -379,14 +417,20 @@ def run_matchup(tp,
         outcome, scores, fallbacks = game.play(verbose=False, force_colors=(white, black))
 
         results[outcome] += 1
-        fallbacks_tp += fallbacks.get(TP_NAME, 0)
+        fallbacks_tp += fallbacks.get(tp_name, 0)
         fallbacks_opp += fallbacks.get(opp_name, 0)
 
         if white_only:
-            # tp is always white
             if outcome == "1-0":
                 tp_wins += 1
             elif outcome == "0-1":
+                opp_wins += 1
+            else:
+                draws += 1
+        elif black_only:
+            if outcome == "0-1":
+                tp_wins += 1
+            elif outcome == "1-0":
                 opp_wins += 1
             else:
                 draws += 1
@@ -460,20 +504,27 @@ def run_watch_game(tp,
                    opponent,
                    opponent_name: str,
                    max_half_moves: int = 200,
-                   clear_screen: bool = True) -> str:
-    """Run one game with live ASCII board updates. Model plays white. Returns outcome (e.g. '1-0')."""
+                   clear_screen: bool = True,
+                   tp_name: str = TP_NAME,
+                   tp_plays_white: bool = True) -> str:
+    """Run one game with live ASCII board. tp_plays_white: main model plays white if True. Returns outcome (e.g. '1-0')."""
     board = chess.Board()
-    white, black = tp, opponent
+    if tp_plays_white:
+        white, black = tp, opponent
+        white_name, black_name = tp_name, opponent_name
+    else:
+        white, black = opponent, tp
+        white_name, black_name = opponent_name, tp_name
     move_count = 0
     last_move_uci: Optional[str] = None
 
     if clear_screen:
         _clear_screen()
     print(
-        f"  {TP_NAME} (White) vs {opponent_name} (Black) — watch mode (one game)"
+        f"  {white_name} (White) vs {black_name} (Black) — watch mode (one game)"
     )
     print("  Press Ctrl+C to stop.\n")
-    draw_board(board, TP_NAME, opponent_name, last_move_uci)
+    draw_board(board, white_name, black_name, last_move_uci)
 
     while not board.is_game_over() and move_count < max_half_moves:
         current = white if board.turn == chess.WHITE else black
@@ -488,7 +539,7 @@ def run_watch_game(tp,
         if move is None or move not in board.legal_moves:
             move = random.choice(list(board.legal_moves))
             move_uci = move.uci()
-            whose = opponent_name if board.turn == chess.BLACK else TP_NAME
+            whose = black_name if board.turn == chess.BLACK else white_name
             print(
                 f"  [{whose} returned no/invalid move — using random legal move]",
                 flush=True)
@@ -499,17 +550,23 @@ def run_watch_game(tp,
         if clear_screen:
             _clear_screen()
         print(
-            f"  {TP_NAME} (White) vs {opponent_name} (Black) — move {move_count}\n"
+            f"  {white_name} (White) vs {black_name} (Black) — move {move_count}\n"
         )
-        draw_board(board, TP_NAME, opponent_name, last_move_uci)
+        draw_board(board, white_name, black_name, last_move_uci)
         print(flush=True)
 
     outcome = board.result()
     print(f"\n  Result: {outcome}  (after {move_count} half-moves)")
+    if outcome == "1-0":
+        print(f"  → {white_name} (White) wins.")
+    elif outcome == "0-1":
+        print(f"  → {black_name} (Black) wins.")
+    elif outcome == "1/2-1/2":
+        print("  → Draw.")
     return outcome
 
 
-def print_matchup_result(r: dict):
+def print_matchup_result(r: dict, tp_name: str = TP_NAME):
     """Print detailed results for a single matchup."""
     n = r["games"]
     print(f"\nResults over {n} games vs {r['opponent']}:")
@@ -517,7 +574,7 @@ def print_matchup_result(r: dict):
         count = r["results"].get(key, 0)
         if count > 0:
             print(f"  {key}: {count} ({100 * count / n:.0f}%)")
-    print(f"\n  {TP_NAME} wins: {r['tp_wins']}")
+    print(f"\n  {tp_name} wins: {r['tp_wins']}")
     print(f"  {r['opponent']} wins:  {r['opp_wins']}")
     print(f"  Draws:            {r['draws']}")
     print(f"  Fallbacks (ours): {r['fallbacks_tp']}")
@@ -561,24 +618,42 @@ def _interactive_args() -> SimpleNamespace:
     watch = _prompt("Watch one game with live board? (y/n) [n]: ",
                     "n").lower() == "y"
     if watch:
-        print("\nOpponents: random, engine-strong, engine-weak, local-strong, local-weak, lm, smol")
+        print("\nModels:", ", ".join(MODEL_CHOICES))
+        model = _prompt("Which model? (recurrent / sayed) [recurrent]: ", "recurrent").lower()
+        if model not in MODEL_CHOICES:
+            model = "recurrent"
+        print("\nStarting player: white, black")
+        color = _prompt("Model plays (white / black) [white]: ", "white").lower()
+        if color not in ("white", "black"):
+            color = "white"
+        white_only = color == "white"
+        print("\nOpponents:", ", ".join(OPPONENT_CHOICES))
         opp = _prompt("Opponent [random]: ", "random").lower()
         if opp not in OPPONENT_CHOICES:
             opp = "random"
-        local = _prompt("Use local model (current dir)? (y/n) [y]: ",
-                        "y").lower() != "n"
+        local = _prompt("Use local model (current dir)? (y/n) [y]: ", "y").lower() != "n" if model == "recurrent" else False
         return SimpleNamespace(
             opponent=opp,
             all=False,
             exclude=[],
             games=200,
-            max_half_moves=200,
+            max_half_moves=350,
             local_dir="." if local else None,
-            white_only=False,
+            white_only=white_only,
+            color=color,
+            model=model,
             watch=True,
             stockfish_path=None,
         )
-    print("\nOpponents: random, engine-strong, engine-weak, local-strong, local-weak, lm, smol, all")
+    print("\nModels:", ", ".join(MODEL_CHOICES))
+    model = _prompt("Which model? (recurrent / sayed) [recurrent]: ", "recurrent").lower()
+    if model not in MODEL_CHOICES:
+        model = "recurrent"
+    print("\nStarting player: white, black, alternating")
+    color = _prompt("Model plays (white / black / alternating) [alternating]: ", "alternating").lower()
+    if color not in COLOR_CHOICES:
+        color = "alternating"
+    print("\nOpponents:", ", ".join(OPPONENT_CHOICES) + ", all")
     opp = _prompt("Opponent (or 'all') [random]: ", "random").lower()
     if opp not in OPPONENT_CHOICES and opp != "all":
         opp = "random"
@@ -597,8 +672,7 @@ def _interactive_args() -> SimpleNamespace:
     except ValueError:
         games = 200
     local = _prompt("Use local model (current dir)? (y/n) [y]: ",
-                    "y").lower() != "n"
-    white_only = _prompt("Model always white? (y/n) [n]: ", "n").lower() == "y"
+                    "y").lower() != "n" if model == "recurrent" else False
     return SimpleNamespace(
         opponent=opp if not use_all else "random",
         all=use_all,
@@ -606,7 +680,9 @@ def _interactive_args() -> SimpleNamespace:
         games=games,
         max_half_moves=200,
         local_dir="." if local else None,
-        white_only=white_only,
+        white_only=(color == "white"),
+        color=color,
+        model=model,
         watch=False,
         stockfish_path=None,
     )
@@ -650,18 +726,30 @@ def main():
                         default=200,
                         help="Max half-moves per game (default: 200)")
     parser.add_argument(
+        "--model",
+        choices=MODEL_CHOICES,
+        default="recurrent",
+        help="Main player model: recurrent (yours) or sayed (INFOMTALC-chess) (default: recurrent)",
+    )
+    parser.add_argument(
+        "--color",
+        choices=COLOR_CHOICES,
+        default="alternating",
+        help="Starting player: white (model always white), black (model always black), or alternating (default: alternating)",
+    )
+    parser.add_argument(
         "--local-dir",
         type=str,
         default=None,
         metavar="DIR",
         help=
-        "Load model from DIR (config.json, tokenizer.json, best_model.pt) instead of HuggingFace. Use '.' for repo root.",
+        "Load model from DIR (config.json, tokenizer.json, best_model.pt) instead of HuggingFace. Use '.' for repo root. Only for --model recurrent.",
     )
     parser.add_argument(
         "--white-only",
         action="store_true",
         help=
-        "Model always plays white (matches notebook eval). Default: alternating colors (tournament-style).",
+        "Model always plays white (same as --color white). Default: alternating.",
     )
     parser.add_argument(
         "--stockfish-path",
@@ -682,22 +770,38 @@ def main():
     else:
         args = parser.parse_args()
 
+    # Derive color options (--white-only overrides --color)
+    color = getattr(args, "color", "alternating")
+    white_only = getattr(args, "white_only", False) or (color == "white")
+    black_only = (color == "black") and not white_only
+
     # Watch mode: one game with live board, then exit
     if args.watch:
-        tp = run_tournament_validation(local_dir=args.local_dir)
+        if args.model == "sayed":
+            ok, reason = check_opponent_available("sayed")
+            if not ok:
+                print(f"Cannot use Sayed model: {reason}")
+                sys.exit(1)
+        tp, tp_name = make_main_player(args.model, local_dir=getattr(args, "local_dir", None))
         ok, reason = check_opponent_available(args.opponent)
         if not ok:
             print(f"Cannot watch vs {args.opponent}: {reason}")
             sys.exit(1)
-        opponent = make_opponent(args.opponent, stockfish_path=getattr(args, 'stockfish_path', None))
-        run_watch_game(tp,
-                       opponent,
-                       args.opponent,
-                       max_half_moves=args.max_half_moves)
+        opponent = make_opponent(args.opponent, stockfish_path=getattr(args, "stockfish_path", None))
+        run_watch_game(
+            tp,
+            opponent,
+            args.opponent,
+            max_half_moves=args.max_half_moves,
+            tp_name=tp_name,
+            tp_plays_white=white_only or (not black_only),
+        )
         return
 
     opponents = OPPONENT_CHOICES if args.all else [args.opponent]
     opponents = [o for o in opponents if o not in args.exclude]
+    if args.model == "sayed":
+        opponents = [o for o in opponents if o != "sayed"]
 
     # Pre-check availability
     available = []
@@ -712,26 +816,35 @@ def main():
         print("\nNo opponents available. Check API keys / GPU.")
         sys.exit(1)
 
+    if args.model == "sayed":
+        ok, reason = check_opponent_available("sayed")
+        if not ok:
+            print(f"\nSayed model requires GPU: {reason}")
+            sys.exit(1)
+
     if args.all:
         print(f"\nWill test against: {', '.join(available)}")
 
-    # --- Tournament validation (always runs) ---
-    tp = run_tournament_validation(local_dir=args.local_dir)
+    tp, tp_name = make_main_player(args.model, local_dir=getattr(args, "local_dir", None))
 
     # Run matchups
     all_results = []
     for name in available:
         print(f"\n{'='*50}")
-        color_note = " [model always white]" if args.white_only else ""
-        print(f"Matchup: {TP_NAME} vs {name} ({args.games} games){color_note}")
+        color_note = " [model always white]" if white_only else (" [model always black]" if black_only else "")
+        print(f"Matchup: {tp_name} vs {name} ({args.games} games){color_note}")
         print(f"{'='*50}")
-        opponent = make_opponent(name, stockfish_path=getattr(args, 'stockfish_path', None))
-        result = run_matchup(tp,
-                             opponent,
-                             args.games,
-                             args.max_half_moves,
-                             white_only=args.white_only)
-        print_matchup_result(result)
+        opponent = make_opponent(name, stockfish_path=getattr(args, "stockfish_path", None))
+        result = run_matchup(
+            tp,
+            opponent,
+            args.games,
+            args.max_half_moves,
+            white_only=white_only,
+            black_only=black_only,
+            tp_name=tp_name,
+        )
+        print_matchup_result(result, tp_name=tp_name)
         if result["fallbacks_tp"] > 0:
             print(
                 f"\n  *** WARNING: {result['fallbacks_tp']} fallback(s) detected! "
