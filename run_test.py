@@ -637,7 +637,7 @@ def _interactive_args() -> SimpleNamespace:
             all=False,
             exclude=[],
             games=200,
-            max_half_moves=350,
+            max_half_moves=200,
             local_dir="." if local else None,
             white_only=white_only,
             color=color,
